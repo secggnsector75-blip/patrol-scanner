@@ -4,7 +4,40 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Patrol QR Scanner</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.min.js"></script>
+<script>
+  // Load jsQR with a fallback CDN in case the primary one is blocked
+  // by a network filter, ad-blocker, or firewall on this device/network.
+  window.__jsqrLoadFailed = false;
+  function loadScript(src, onSuccess, onFail) {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = onSuccess;
+    s.onerror = onFail;
+    document.head.appendChild(s);
+  }
+  loadScript(
+    "https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.min.js",
+    function() { console.log("jsQR loaded from cdnjs"); },
+    function() {
+      console.log("cdnjs failed, trying jsdelivr...");
+      loadScript(
+        "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js",
+        function() { console.log("jsQR loaded from jsdelivr"); },
+        function() {
+          console.log("jsdelivr also failed, trying unpkg...");
+          loadScript(
+            "https://unpkg.com/jsqr@1.4.0/dist/jsQR.min.js",
+            function() { console.log("jsQR loaded from unpkg"); },
+            function() {
+              console.log("All CDNs failed to load jsQR");
+              window.__jsqrLoadFailed = true;
+            }
+          );
+        }
+      );
+    }
+  );
+</script>
 <style>
   html, body {
     margin: 0;
@@ -118,9 +151,19 @@
     const lastErrorEl = document.getElementById('lastError');
     let frameCount = 0;
 
-    // Check whether the jsQR library actually loaded from the CDN
-    jsqrStatusEl.textContent = (typeof jsQR !== 'undefined') ? "yes" : "NO - library failed to load";
-    jsqrStatusEl.style.color = (typeof jsQR !== 'undefined') ? "#4CAF50" : "#f44336";
+    // Poll for jsQR availability since it now loads via async fallback CDNs
+    const jsqrCheckInterval = setInterval(function() {
+      if (typeof jsQR !== 'undefined') {
+        jsqrStatusEl.textContent = "yes";
+        jsqrStatusEl.style.color = "#4CAF50";
+        clearInterval(jsqrCheckInterval);
+      } else if (window.__jsqrLoadFailed) {
+        jsqrStatusEl.textContent = "NO - all CDNs blocked on this network";
+        jsqrStatusEl.style.color = "#f44336";
+        statusEl.textContent = "❌ QR library could not load. Try a different network or disable content/ad blockers.";
+        clearInterval(jsqrCheckInterval);
+      }
+    }, 300);
 
     let stream = null;
     let scanning = true;   // whether we're actively looking for a new code
