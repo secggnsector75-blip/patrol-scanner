@@ -92,6 +92,11 @@
   <div id="status">Requesting camera access...</div>
   <div id="lastScan"></div>
   <button id="pauseBtn" disabled>⏸ Pause</button>
+  <div id="debugInfo" style="margin-top:14px;font-size:11px;color:#777;text-align:center;padding:0 16px;">
+    jsQR loaded: <span id="jsqrStatus">checking...</span><br>
+    Frames scanned: <span id="frameCount">0</span><br>
+    Last error: <span id="lastError">none</span>
+  </div>
 
   <script>
     // ============================================================
@@ -108,6 +113,14 @@
     const lastScanEl = document.getElementById('lastScan');
     const overlay = document.getElementById('scanOverlay');
     const pauseBtn = document.getElementById('pauseBtn');
+    const jsqrStatusEl = document.getElementById('jsqrStatus');
+    const frameCountEl = document.getElementById('frameCount');
+    const lastErrorEl = document.getElementById('lastError');
+    let frameCount = 0;
+
+    // Check whether the jsQR library actually loaded from the CDN
+    jsqrStatusEl.textContent = (typeof jsQR !== 'undefined') ? "yes" : "NO - library failed to load";
+    jsqrStatusEl.style.color = (typeof jsQR !== 'undefined') ? "#4CAF50" : "#f44336";
 
     let stream = null;
     let scanning = true;   // whether we're actively looking for a new code
@@ -146,34 +159,49 @@
     }
 
     function scanLoop() {
-      if (!paused && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      try {
+        if (!paused && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const code = jsQR(imageData.data, imageData.width, imageData.height, {
-          inversionAttempts: "dontInvert"
-        });
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-        const now = Date.now();
-        if (code && code.data && scanning) {
-          // Avoid spamming the same code repeatedly within 2 seconds
-          if (code.data !== lastToken || (now - lastTokenTime) > 2000) {
-            lastToken = code.data;
-            lastTokenTime = now;
-            scanning = false;
+          if (typeof jsQR === 'undefined') {
+            lastErrorEl.textContent = "jsQR library not loaded";
+            lastErrorEl.style.color = "#f44336";
+          } else {
+            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+              inversionAttempts: "attemptBoth"
+            });
 
-            overlay.style.borderColor = "#4CAF50";
-            lastScanEl.textContent = "✅ Sent checkpoint scan...";
-            sendToOpener({ type: "PATROL_QR_SCAN", token: code.data });
+            frameCount++;
+            frameCountEl.textContent = frameCount;
 
-            setTimeout(function() {
-              overlay.style.borderColor = "rgba(255,255,255,0.5)";
-              scanning = true;
-            }, 1200);
+            const now = Date.now();
+            if (code && code.data && scanning) {
+              // Avoid spamming the same code repeatedly within 2 seconds
+              if (code.data !== lastToken || (now - lastTokenTime) > 2000) {
+                lastToken = code.data;
+                lastTokenTime = now;
+                scanning = false;
+
+                overlay.style.borderColor = "#4CAF50";
+                lastScanEl.textContent = "✅ Sent checkpoint scan...";
+                sendToOpener({ type: "PATROL_QR_SCAN", token: code.data });
+
+                setTimeout(function() {
+                  overlay.style.borderColor = "rgba(255,255,255,0.5)";
+                  scanning = true;
+                }, 1200);
+              }
+            }
           }
         }
+      } catch (err) {
+        // Catch any error so a single bad frame can never kill the scan loop
+        lastErrorEl.textContent = err.message;
+        lastErrorEl.style.color = "#f44336";
       }
       requestAnimationFrame(scanLoop);
     }
