@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Patrol QR Scanner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.min.js"></script>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #111;
+    color: #fff;
+    font-family: Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+  }
+  #scannerContainer {
+    position: relative;
+    width: 100%;
+    max-width: 480px;
+    margin-top: 10px;
+  }
+  video {
+    width: 100%;
+    border-radius: 10px;
+    background: #000;
+    display: block;
+  }
+  #scanOverlay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 200px;
+    height: 200px;
+    border: 3px solid rgba(255,255,255,0.5);
+    border-radius: 12px;
+    pointer-events: none;
+    box-shadow: 0 0 0 4000px rgba(0,0,0,0.3);
+    transition: border-color 0.2s;
+  }
+  #scanOverlay .label {
+    position: absolute;
+    top: -12px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.7);
+    color: #fff;
+    padding: 2px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  #status {
+    margin-top: 14px;
+    font-size: 14px;
+    color: #ccc;
+    text-align: center;
+    padding: 0 16px;
+  }
+  #lastScan {
+    margin-top: 8px;
+    font-size: 13px;
+    color: #4CAF50;
+    min-height: 18px;
+  }
+  button {
+    margin-top: 14px;
+    padding: 10px 22px;
+    font-size: 14px;
+    border: none;
+    border-radius: 6px;
+    background: #555;
+    color: #fff;
+    cursor: pointer;
+  }
+  button:disabled { background: #333; cursor: not-allowed; }
+</style>
+</head>
+<body>
+
+  <h3 style="margin-bottom:4px;">📷 Patrol Scanner</h3>
+  <div id="scannerContainer">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+    <div id="scanOverlay"><div class="label">Align QR Code</div></div>
+  </div>
+
+  <div id="status">Requesting camera access...</div>
+  <div id="lastScan"></div>
+  <button id="pauseBtn" disabled>⏸ Pause</button>
+
+  <script>
+    // ============================================================
+    // CONFIG — replace with the origin of your deployed Apps Script web app
+    // Example: "https://script.google.com" (leave as-is for standard deployments,
+    // or your custom domain if you use one)
+    // ============================================================
+    const TARGET_ORIGIN = "https://script.google.com";
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const lastScanEl = document.getElementById('lastScan');
+    const overlay = document.getElementById('scanOverlay');
+    const pauseBtn = document.getElementById('pauseBtn');
+
+    let stream = null;
+    let scanning = true;   // whether we're actively looking for a new code
+    let paused = false;    // whether the user paused scanning
+    let lastToken = null;
+    let lastTokenTime = 0;
+
+    function sendToOpener(message) {
+      if (window.opener) {
+        window.opener.postMessage(message, TARGET_ORIGIN);
+      }
+    }
+
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false
+        });
+        video.srcObject = stream;
+        video.onloadedmetadata = function() {
+          video.play();
+          statusEl.textContent = "Scanning for checkpoints...";
+          pauseBtn.disabled = false;
+          sendToOpener({ type: "PATROL_CAMERA_READY" });
+          requestAnimationFrame(scanLoop);
+        };
+      } catch (err) {
+        let msg = err.message;
+        if (err.name === 'NotAllowedError') msg = "Camera permission denied. Allow camera access and reopen this window.";
+        else if (err.name === 'NotFoundError') msg = "No camera detected on this device.";
+        else if (err.name === 'NotReadableError') msg = "Camera is busy or in use by another app.";
+        statusEl.textContent = "❌ " + msg;
+        sendToOpener({ type: "PATROL_CAMERA_ERROR", message: msg });
+      }
+    }
+
+    function scanLoop() {
+      if (!paused && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+          inversionAttempts: "dontInvert"
+        });
+
+        const now = Date.now();
+        if (code && code.data && scanning) {
+          // Avoid spamming the same code repeatedly within 2 seconds
+          if (code.data !== lastToken || (now - lastTokenTime) > 2000) {
+            lastToken = code.data;
+            lastTokenTime = now;
+            scanning = false;
+
+            overlay.style.borderColor = "#4CAF50";
+            lastScanEl.textContent = "✅ Sent checkpoint scan...";
+            sendToOpener({ type: "PATROL_QR_SCAN", token: code.data });
+
+            setTimeout(function() {
+              overlay.style.borderColor = "rgba(255,255,255,0.5)";
+              scanning = true;
+            }, 1200);
+          }
+        }
+      }
+      requestAnimationFrame(scanLoop);
+    }
+
+    pauseBtn.addEventListener('click', function() {
+      paused = !paused;
+      pauseBtn.textContent = paused ? "▶ Resume" : "⏸ Pause";
+      statusEl.textContent = paused ? "Scanning paused." : "Scanning for checkpoints...";
+    });
+
+    // Allow the opener to remotely pause/resume or close this window
+    window.addEventListener('message', function(event) {
+      if (!event.data) return;
+      if (event.data.type === "PATROL_TOGGLE_CAMERA") {
+        pauseBtn.click();
+      } else if (event.data.type === "PATROL_CLOSE_SCANNER") {
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        window.close();
+      }
+    });
+
+    // Stop camera cleanly if the user closes this tab/window manually
+    window.addEventListener('beforeunload', function() {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    });
+
+    startCamera();
+  </script>
+
+</body>
+</html>
