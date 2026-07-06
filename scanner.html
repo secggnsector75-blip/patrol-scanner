@@ -132,12 +132,13 @@
   </div>
 
   <script>
-    // ============================================================
-    // CONFIG — replace with the origin of your deployed Apps Script web app
-    // Example: "https://script.google.com" (leave as-is for standard deployments,
-    // or your custom domain if you use one)
-    // ============================================================
-    const TARGET_ORIGIN = "https://script.google.com";
+    // NOTE: Apps Script serves your page inside a sandboxed iframe on a
+    // dynamic domain like "n-xxxxx.script.googleusercontent.com" -- NOT
+    // script.google.com itself. Since we can't predict that exact domain,
+    // we use "*" here. This is safe because Index.html independently
+    // verifies the SENDER's origin (this GitHub Pages site) before
+    // trusting any message it receives.
+    const TARGET_ORIGIN = "*";
 
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
@@ -201,6 +202,27 @@
       }
     }
 
+    function finishScan() {
+      // Stop the camera immediately once a checkpoint is scanned
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      pauseBtn.disabled = true;
+      lastScanEl.textContent = "✅ Checkpoint scanned! Closing...";
+      statusEl.textContent = "Done. Returning to the Patrol app.";
+
+      // Give postMessage a brief moment to actually deliver, then close.
+      setTimeout(function() {
+        window.close();
+        // If window.close() didn't work (some browsers block it), let the
+        // user know they can close it themselves.
+        setTimeout(function() {
+          statusEl.textContent = "✅ Scanned. You can close this tab now.";
+        }, 500);
+      }, 600);
+    }
+
     function scanLoop() {
       try {
         if (!paused && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
@@ -223,21 +245,14 @@
 
             const now = Date.now();
             if (code && code.data && scanning) {
-              // Avoid spamming the same code repeatedly within 2 seconds
-              if (code.data !== lastToken || (now - lastTokenTime) > 2000) {
-                lastToken = code.data;
-                lastTokenTime = now;
-                scanning = false;
+              lastToken = code.data;
+              lastTokenTime = now;
+              scanning = false;
 
-                overlay.style.borderColor = "#4CAF50";
-                lastScanEl.textContent = "✅ Sent checkpoint scan...";
-                sendToOpener({ type: "PATROL_QR_SCAN", token: code.data });
-
-                setTimeout(function() {
-                  overlay.style.borderColor = "rgba(255,255,255,0.5)";
-                  scanning = true;
-                }, 1200);
-              }
+              overlay.style.borderColor = "#4CAF50";
+              sendToOpener({ type: "PATROL_QR_SCAN", token: code.data });
+              finishScan();
+              return; // stop this scanLoop invocation, don't schedule another frame
             }
           }
         }
@@ -251,8 +266,13 @@
 
     pauseBtn.addEventListener('click', function() {
       paused = !paused;
+      scanning = true; // allow detecting a new code again
       pauseBtn.textContent = paused ? "▶ Resume" : "⏸ Pause";
       statusEl.textContent = paused ? "Scanning paused." : "Scanning for checkpoints...";
+      if (!paused) {
+        overlay.style.borderColor = "rgba(255,255,255,0.5)";
+        lastScanEl.textContent = "";
+      }
     });
 
     // Allow the opener to remotely pause/resume or close this window
