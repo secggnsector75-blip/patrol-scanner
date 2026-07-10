@@ -277,14 +277,26 @@
 
     function captureSelfie() {
       const c = document.createElement('canvas');
-      c.width = frontVideo.videoWidth;
-      c.height = frontVideo.videoHeight;
+
+      // Downscale to a max width of 480px before encoding. Native front-camera
+      // resolution on most phones is 3000px+ wide, which produces multi-megabyte
+      // base64 strings — sending several of those through postMessage and
+      // google.script.run over a patrol session exhausts WebView memory and
+      // causes the white-screen crash. 480px is still perfectly readable for
+      // confirmation purposes.
+      const MAX_WIDTH = 480;
+      const scale = Math.min(1, MAX_WIDTH / frontVideo.videoWidth);
+      c.width = Math.round(frontVideo.videoWidth * scale);
+      c.height = Math.round(frontVideo.videoHeight * scale);
+
       const cctx = c.getContext('2d');
       cctx.translate(c.width, 0);
       cctx.scale(-1, 1); // mirror to match the on-screen preview
       cctx.drawImage(frontVideo, 0, 0, c.width, c.height);
 
-      pendingPhoto = c.toDataURL('image/jpeg', 0.75);
+      // Lower quality further shrinks the payload — fine for a confirmation
+      // photo, not meant to be a print-quality image.
+      pendingPhoto = c.toDataURL('image/jpeg', 0.6);
       selfiePreview.src = pendingPhoto;
       selfiePreview.style.display = 'block';
       frontVideo.style.display = 'none';
