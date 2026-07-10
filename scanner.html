@@ -57,24 +57,6 @@
     border-radius: 6px; background: #555; color: #fff; cursor: pointer;
   }
   button:disabled { background: #333; cursor: not-allowed; }
-
-  #selfieOverlay {
-    display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-    background: #111; z-index: 20; flex-direction: column; align-items: center;
-  }
-  #selfieOverlay.active { display: flex; }
-  #selfieHeader { padding: 14px; font-size: 15px; text-align: center; background: rgba(0,0,0,0.4); width: 100%; box-sizing: border-box; }
-  #selfieStage { position: relative; width: 100%; max-width: 480px; }
-  #selfieStage video, #selfieStage img {
-    width: 100%; border-radius: 10px; background: #000; display: block;
-    transform: scaleX(-1);
-  }
-  #selfieControls { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; justify-content: center; }
-  #selfieControls button { margin-top: 0; min-width: 110px; }
-  #captureBtn { background: #4CAF50; }
-  #confirmBtn { background: #2196F3; }
-  #retakeBtn { background: #888; }
-  #cancelSelfieBtn { background: #e33; }
 </style>
 </head>
 <body>
@@ -96,27 +78,11 @@
     Last error: <span id="lastError">none</span>
   </div>
 
-  <div id="selfieOverlay">
-    <div id="selfieHeader">📸 Take a selfie to confirm this scan</div>
-    <div id="selfieStage">
-      <video id="frontVideo" autoplay playsinline muted></video>
-      <img id="selfiePreview" style="display:none;">
-    </div>
-    <div id="selfieControls">
-      <button id="captureBtn">📸 Capture</button>
-      <button id="confirmBtn" style="display:none;">✅ Confirm</button>
-      <button id="retakeBtn" style="display:none;">🔄 Retake</button>
-      <button id="cancelSelfieBtn">✕ Cancel Scan</button>
-    </div>
-  </div>
-
   <script>
-    const params = new URLSearchParams(window.location.search);
-    const TARGET_ORIGIN = "*";
-    const REQUIRE_SELFIE = params.get('selfie') === "1";
+    const TARGET_ORIGIN = "*"; // opener verifies its own origin independently
 
-    const MAX_QR_WIDTH = 480;       // capped canvas width for QR decoding
-    const SCAN_INTERVAL_MS = 250;   // only run getImageData()/jsQR ~4x/sec, not every animation frame
+    const MAX_QR_WIDTH = 480;
+    const SCAN_INTERVAL_MS = 250;
 
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
@@ -131,16 +97,11 @@
     const lastErrorEl = document.getElementById('lastError');
     let scanCount = 0;
 
-    // ============================================================
-    //  DEBUG LOGGING — sent to the opener so the log trail survives
-    //  even if this popup crashes/goes blank. Index.html displays
-    //  these in the scanner status area.
-    // ============================================================
     function dlog(msg) {
       try {
         console.log("[scanner] " + msg);
         sendToOpener({ type: "PATROL_DEBUG_LOG", message: msg, ts: Date.now() });
-      } catch (e) { /* ignore logging failures */ }
+      } catch (e) { /* ignore */ }
     }
 
     const jsqrCheckInterval = setInterval(function() {
@@ -157,20 +118,14 @@
     }, 300);
 
     let rearStream = null;
-    let frontStream = null;
     let scanning = true;
     let paused = false;
-    let pendingToken = null;
-    let pendingPhoto = null;
     let scanTimerHandle = null;
 
     function sendToOpener(message) {
-      if (window.opener) {
-        window.opener.postMessage(message, TARGET_ORIGIN);
-      }
+      if (window.opener) window.opener.postMessage(message, TARGET_ORIGIN);
     }
 
-    // ---- Rear camera ----
     function startRearCamera() {
       dlog("startRearCamera: requesting");
       return navigator.mediaDevices.getUserMedia({
@@ -186,7 +141,6 @@
         video.srcObject = stream;
         return new Promise(function(resolve) {
           video.onloadedmetadata = function() {
-            dlog("startRearCamera: metadata loaded, playing");
             video.play();
             resolve();
           };
@@ -194,12 +148,7 @@
       });
     }
 
-    // CRITICAL for iOS Safari: stopping the track alone is not enough —
-    // the <video> element retains decode buffers until srcObject is
-    // explicitly cleared. Skipping this step is what causes memory to
-    // climb until WebKit silently kills the page (the "white screen").
     function stopRearCamera() {
-      dlog("stopRearCamera: called, had stream=" + !!rearStream);
       if (rearStream) {
         rearStream.getTracks().forEach(t => t.stop());
         rearStream = null;
@@ -209,26 +158,14 @@
         clearTimeout(scanTimerHandle);
         scanTimerHandle = null;
       }
-      dlog("stopRearCamera: done");
     }
 
-    function stopFrontCamera() {
-      dlog("stopFrontCamera: called, had stream=" + !!frontStream);
-      if (frontStream) {
-        frontStream.getTracks().forEach(t => t.stop());
-        frontStream = null;
-      }
-      frontVideo.srcObject = null;
-      dlog("stopFrontCamera: done");
-    }
-
-    dlog("boot: starting rear camera for the first time");
+    dlog("boot: starting rear camera");
     startRearCamera()
       .then(function() {
         statusEl.textContent = "Scanning for checkpoints...";
         pauseBtn.disabled = false;
         sendToOpener({ type: "PATROL_CAMERA_READY" });
-        dlog("boot: camera ready, entering scan loop");
         scheduleNextScan();
       })
       .catch(function(err) {
@@ -241,9 +178,6 @@
         sendToOpener({ type: "PATROL_CAMERA_ERROR", message: msg });
       });
 
-    // Throttled scan loop — runs detection at most every SCAN_INTERVAL_MS,
-    // instead of every requestAnimationFrame (~60x/sec on iPhone). This is
-    // the single biggest reduction in memory/CPU churn on iOS Safari.
     function scheduleNextScan() {
       scanTimerHandle = setTimeout(runScanCheck, SCAN_INTERVAL_MS);
     }
@@ -268,17 +202,20 @@
 
             if (code && code.data && scanning) {
               scanning = false;
-              pendingToken = code.data;
               overlay.style.borderColor = "#4CAF50";
-              dlog("QR detected: " + code.data + " (requireSelfie=" + REQUIRE_SELFIE + ")");
+              dlog("QR detected: " + code.data);
 
-              if (REQUIRE_SELFIE) {
-                statusEl.textContent = "QR detected — confirm with a selfie";
-                openSelfieStep();
-              } else {
-                completeScanWithoutSelfie();
-              }
-              return; // don't schedule another scan yet — resumes after selfie/confirm
+              // No selfie step anymore — send immediately and resume.
+              sendToOpener({ type: "PATROL_QR_SCAN", token: code.data });
+              lastScanEl.textContent = "✅ Scanned: " + code.data;
+
+              setTimeout(function() {
+                scanning = true;
+                overlay.style.borderColor = "rgba(255,255,255,0.5)";
+                lastScanEl.textContent = "";
+                scheduleNextScan();
+              }, 1000);
+              return;
             }
           }
         }
@@ -289,155 +226,6 @@
       }
       scheduleNextScan();
     }
-
-    // For sites that don't require a selfie — send immediately, then resume scanning
-    function completeScanWithoutSelfie() {
-      dlog("completeScanWithoutSelfie: sending token to opener");
-      sendToOpener({ type: "PATROL_QR_SCAN", token: pendingToken, photo: "" });
-      lastScanEl.textContent = "✅ Scanned: " + pendingToken;
-      setTimeout(function() {
-        scanning = true;
-        pendingToken = null;
-        overlay.style.borderColor = "rgba(255,255,255,0.5)";
-        lastScanEl.textContent = "";
-        scheduleNextScan();
-      }, 1200);
-    }
-
-    // ============================================================
-    //  MANDATORY SELFIE STEP
-    // ============================================================
-
-    const selfieOverlay = document.getElementById('selfieOverlay');
-    const frontVideo = document.getElementById('frontVideo');
-    const selfiePreview = document.getElementById('selfiePreview');
-    const captureBtn = document.getElementById('captureBtn');
-    const confirmBtn = document.getElementById('confirmBtn');
-    const retakeBtn = document.getElementById('retakeBtn');
-    const cancelSelfieBtn = document.getElementById('cancelSelfieBtn');
-
-    function openSelfieStep() {
-      dlog("openSelfieStep: releasing rear camera first");
-      // Release the rear camera fully before opening the front camera —
-      // never hold both hardware streams open at once.
-      stopRearCamera();
-
-      selfieOverlay.classList.add('active');
-      captureBtn.style.display = 'inline-block';
-      confirmBtn.style.display = 'none';
-      retakeBtn.style.display = 'none';
-      selfiePreview.style.display = 'none';
-      frontVideo.style.display = 'block';
-
-      dlog("openSelfieStep: requesting front camera");
-      navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'user' }, width: { ideal: MAX_QR_WIDTH } }
-      })
-        .then(function(stream) {
-          dlog("openSelfieStep: front camera acquired");
-          frontStream = stream;
-          frontVideo.srcObject = stream;
-          frontVideo.play();
-        })
-        .catch(function(err) {
-          dlog("openSelfieStep: FAILED - " + err.name + ": " + err.message);
-          alert("A front-camera selfie is required to complete this scan, but the camera could not be accessed (" + err.name + "). Please allow camera access and try scanning again.");
-          cancelSelfie();
-        });
-    }
-
-    function captureSelfie() {
-      dlog("captureSelfie: drawing to canvas, videoWidth=" + frontVideo.videoWidth + " videoHeight=" + frontVideo.videoHeight);
-      const c = document.createElement('canvas');
-      const MAX_SELFIE_WIDTH = 400;
-      const scale = Math.min(1, MAX_SELFIE_WIDTH / frontVideo.videoWidth);
-      c.width = Math.round(frontVideo.videoWidth * scale);
-      c.height = Math.round(frontVideo.videoHeight * scale);
-
-      const cctx = c.getContext('2d');
-      cctx.translate(c.width, 0);
-      cctx.scale(-1, 1);
-      cctx.drawImage(frontVideo, 0, 0, c.width, c.height);
-
-      pendingPhoto = c.toDataURL('image/jpeg', 0.55);
-      dlog("captureSelfie: encoded, payload length=" + pendingPhoto.length);
-      selfiePreview.src = pendingPhoto;
-      selfiePreview.style.display = 'block';
-      frontVideo.style.display = 'none';
-
-      captureBtn.style.display = 'none';
-      confirmBtn.style.display = 'inline-block';
-      retakeBtn.style.display = 'inline-block';
-    }
-
-    function retakeSelfie() {
-      dlog("retakeSelfie");
-      pendingPhoto = null;
-      selfiePreview.src = ""; // release the previous image data
-      selfiePreview.style.display = 'none';
-      frontVideo.style.display = 'block';
-      captureBtn.style.display = 'inline-block';
-      confirmBtn.style.display = 'none';
-      retakeBtn.style.display = 'none';
-    }
-
-    function confirmSelfie() {
-      if (!pendingPhoto) return;
-      dlog("confirmSelfie: sending token+photo to opener, payload length=" + pendingPhoto.length);
-      const photo = pendingPhoto;
-
-      sendToOpener({ type: "PATROL_QR_SCAN", token: pendingToken, photo: photo });
-      dlog("confirmSelfie: sent to opener");
-
-      closeSelfieOverlayAndCleanup();
-      selfiePreview.src = ""; // release the captured image data now that it's sent
-      lastScanEl.textContent = "✅ Scanned with selfie confirmation";
-      pendingToken = null;
-      pendingPhoto = null;
-
-      // Resume rear camera scanning for the next checkpoint — window stays open.
-      dlog("confirmSelfie: restarting rear camera");
-      startRearCamera()
-        .then(function() {
-          dlog("confirmSelfie: rear camera restarted, resuming scan loop");
-          scanning = true;
-          overlay.style.borderColor = "rgba(255,255,255,0.5)";
-          statusEl.textContent = "Scanning for checkpoints...";
-          setTimeout(function() { lastScanEl.textContent = ""; }, 1500);
-          scheduleNextScan();
-        })
-        .catch(function(err) {
-          dlog("confirmSelfie: rear restart FAILED - " + err.name + ": " + err.message);
-          statusEl.textContent = "❌ Could not restart camera: " + err.message;
-        });
-    }
-
-    function cancelSelfie() {
-      dlog("cancelSelfie");
-      closeSelfieOverlayAndCleanup();
-      pendingToken = null;
-      pendingPhoto = null;
-      scanning = true;
-      statusEl.textContent = "Scan cancelled — align QR code to try again";
-      overlay.style.borderColor = "rgba(255,255,255,0.5)";
-
-      startRearCamera()
-        .then(function() { scheduleNextScan(); })
-        .catch(function(err) {
-          dlog("cancelSelfie: rear restart FAILED - " + err.name + ": " + err.message);
-          statusEl.textContent = "❌ Could not restart camera: " + err.message;
-        });
-    }
-
-    function closeSelfieOverlayAndCleanup() {
-      selfieOverlay.classList.remove('active');
-      stopFrontCamera();
-    }
-
-    captureBtn.addEventListener('click', captureSelfie);
-    confirmBtn.addEventListener('click', confirmSelfie);
-    retakeBtn.addEventListener('click', retakeSelfie);
-    cancelSelfieBtn.addEventListener('click', cancelSelfie);
 
     pauseBtn.addEventListener('click', function() {
       paused = !paused;
@@ -453,7 +241,6 @@
     closeScannerBtn.addEventListener('click', function() {
       dlog("closeScannerBtn clicked");
       stopRearCamera();
-      stopFrontCamera();
       window.close();
     });
 
@@ -464,25 +251,18 @@
       } else if (event.data.type === "PATROL_CLOSE_SCANNER") {
         dlog("received PATROL_CLOSE_SCANNER");
         stopRearCamera();
-        stopFrontCamera();
         window.close();
       }
     });
 
     window.addEventListener('beforeunload', function() {
-      dlog("beforeunload firing");
       stopRearCamera();
-      stopFrontCamera();
     });
 
     window.addEventListener('error', function(e) {
       lastErrorEl.textContent = e.message;
       lastErrorEl.style.color = "#f44336";
-      dlog("window.onerror: " + e.message + " at " + e.filename + ":" + e.lineno);
-    });
-
-    window.addEventListener('unhandledrejection', function(e) {
-      dlog("unhandledrejection: " + (e.reason && e.reason.message ? e.reason.message : e.reason));
+      dlog("window.onerror: " + e.message);
     });
   </script>
 
