@@ -131,6 +131,18 @@
     const lastErrorEl = document.getElementById('lastError');
     let scanCount = 0;
 
+    // ============================================================
+    //  DEBUG LOGGING — sent to the opener so the log trail survives
+    //  even if this popup crashes/goes blank. Index.html displays
+    //  these in the scanner status area.
+    // ============================================================
+    function dlog(msg) {
+      try {
+        console.log("[scanner] " + msg);
+        sendToOpener({ type: "PATROL_DEBUG_LOG", message: msg, ts: Date.now() });
+      } catch (e) { /* ignore logging failures */ }
+    }
+
     const jsqrCheckInterval = setInterval(function() {
       if (typeof jsQR !== 'undefined') {
         jsqrStatusEl.textContent = "yes";
@@ -160,6 +172,7 @@
 
     // ---- Rear camera ----
     function startRearCamera() {
+      dlog("startRearCamera: requesting");
       return navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: "environment",
@@ -168,10 +181,12 @@
         },
         audio: false
       }).then(function(stream) {
+        dlog("startRearCamera: stream acquired");
         rearStream = stream;
         video.srcObject = stream;
         return new Promise(function(resolve) {
           video.onloadedmetadata = function() {
+            dlog("startRearCamera: metadata loaded, playing");
             video.play();
             resolve();
           };
@@ -184,6 +199,7 @@
     // explicitly cleared. Skipping this step is what causes memory to
     // climb until WebKit silently kills the page (the "white screen").
     function stopRearCamera() {
+      dlog("stopRearCamera: called, had stream=" + !!rearStream);
       if (rearStream) {
         rearStream.getTracks().forEach(t => t.stop());
         rearStream = null;
@@ -193,21 +209,26 @@
         clearTimeout(scanTimerHandle);
         scanTimerHandle = null;
       }
+      dlog("stopRearCamera: done");
     }
 
     function stopFrontCamera() {
+      dlog("stopFrontCamera: called, had stream=" + !!frontStream);
       if (frontStream) {
         frontStream.getTracks().forEach(t => t.stop());
         frontStream = null;
       }
       frontVideo.srcObject = null;
+      dlog("stopFrontCamera: done");
     }
 
+    dlog("boot: starting rear camera for the first time");
     startRearCamera()
       .then(function() {
         statusEl.textContent = "Scanning for checkpoints...";
         pauseBtn.disabled = false;
         sendToOpener({ type: "PATROL_CAMERA_READY" });
+        dlog("boot: camera ready, entering scan loop");
         scheduleNextScan();
       })
       .catch(function(err) {
@@ -216,6 +237,7 @@
         else if (err.name === 'NotFoundError') msg = "No camera detected on this device.";
         else if (err.name === 'NotReadableError') msg = "Camera is busy or in use by another app.";
         statusEl.textContent = "❌ " + msg;
+        dlog("boot: FAILED - " + err.name + ": " + err.message);
         sendToOpener({ type: "PATROL_CAMERA_ERROR", message: msg });
       });
 
@@ -248,6 +270,7 @@
               scanning = false;
               pendingToken = code.data;
               overlay.style.borderColor = "#4CAF50";
+              dlog("QR detected: " + code.data + " (requireSelfie=" + REQUIRE_SELFIE + ")");
 
               if (REQUIRE_SELFIE) {
                 statusEl.textContent = "QR detected — confirm with a selfie";
@@ -262,12 +285,14 @@
       } catch (err) {
         lastErrorEl.textContent = err.message;
         lastErrorEl.style.color = "#f44336";
+        dlog("runScanCheck ERROR: " + err.message);
       }
       scheduleNextScan();
     }
 
     // For sites that don't require a selfie — send immediately, then resume scanning
     function completeScanWithoutSelfie() {
+      dlog("completeScanWithoutSelfie: sending token to opener");
       sendToOpener({ type: "PATROL_QR_SCAN", token: pendingToken, photo: "" });
       lastScanEl.textContent = "✅ Scanned: " + pendingToken;
       setTimeout(function() {
@@ -292,6 +317,7 @@
     const cancelSelfieBtn = document.getElementById('cancelSelfieBtn');
 
     function openSelfieStep() {
+      dlog("openSelfieStep: releasing rear camera first");
       // Release the rear camera fully before opening the front camera —
       // never hold both hardware streams open at once.
       stopRearCamera();
@@ -303,21 +329,25 @@
       selfiePreview.style.display = 'none';
       frontVideo.style.display = 'block';
 
+      dlog("openSelfieStep: requesting front camera");
       navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'user' }, width: { ideal: MAX_QR_WIDTH } }
       })
         .then(function(stream) {
+          dlog("openSelfieStep: front camera acquired");
           frontStream = stream;
           frontVideo.srcObject = stream;
           frontVideo.play();
         })
         .catch(function(err) {
+          dlog("openSelfieStep: FAILED - " + err.name + ": " + err.message);
           alert("A front-camera selfie is required to complete this scan, but the camera could not be accessed (" + err.name + "). Please allow camera access and try scanning again.");
           cancelSelfie();
         });
     }
 
     function captureSelfie() {
+      dlog("captureSelfie: drawing to canvas, videoWidth=" + frontVideo.videoWidth + " videoHeight=" + frontVideo.videoHeight);
       const c = document.createElement('canvas');
       const MAX_SELFIE_WIDTH = 400;
       const scale = Math.min(1, MAX_SELFIE_WIDTH / frontVideo.videoWidth);
@@ -330,6 +360,7 @@
       cctx.drawImage(frontVideo, 0, 0, c.width, c.height);
 
       pendingPhoto = c.toDataURL('image/jpeg', 0.55);
+      dlog("captureSelfie: encoded, payload length=" + pendingPhoto.length);
       selfiePreview.src = pendingPhoto;
       selfiePreview.style.display = 'block';
       frontVideo.style.display = 'none';
@@ -340,7 +371,9 @@
     }
 
     function retakeSelfie() {
+      dlog("retakeSelfie");
       pendingPhoto = null;
+      selfiePreview.src = ""; // release the previous image data
       selfiePreview.style.display = 'none';
       frontVideo.style.display = 'block';
       captureBtn.style.display = 'inline-block';
@@ -350,18 +383,23 @@
 
     function confirmSelfie() {
       if (!pendingPhoto) return;
+      dlog("confirmSelfie: sending token+photo to opener, payload length=" + pendingPhoto.length);
       const photo = pendingPhoto;
 
       sendToOpener({ type: "PATROL_QR_SCAN", token: pendingToken, photo: photo });
+      dlog("confirmSelfie: sent to opener");
 
       closeSelfieOverlayAndCleanup();
+      selfiePreview.src = ""; // release the captured image data now that it's sent
       lastScanEl.textContent = "✅ Scanned with selfie confirmation";
       pendingToken = null;
       pendingPhoto = null;
 
       // Resume rear camera scanning for the next checkpoint — window stays open.
+      dlog("confirmSelfie: restarting rear camera");
       startRearCamera()
         .then(function() {
+          dlog("confirmSelfie: rear camera restarted, resuming scan loop");
           scanning = true;
           overlay.style.borderColor = "rgba(255,255,255,0.5)";
           statusEl.textContent = "Scanning for checkpoints...";
@@ -369,11 +407,13 @@
           scheduleNextScan();
         })
         .catch(function(err) {
+          dlog("confirmSelfie: rear restart FAILED - " + err.name + ": " + err.message);
           statusEl.textContent = "❌ Could not restart camera: " + err.message;
         });
     }
 
     function cancelSelfie() {
+      dlog("cancelSelfie");
       closeSelfieOverlayAndCleanup();
       pendingToken = null;
       pendingPhoto = null;
@@ -384,6 +424,7 @@
       startRearCamera()
         .then(function() { scheduleNextScan(); })
         .catch(function(err) {
+          dlog("cancelSelfie: rear restart FAILED - " + err.name + ": " + err.message);
           statusEl.textContent = "❌ Could not restart camera: " + err.message;
         });
     }
@@ -410,6 +451,7 @@
     });
 
     closeScannerBtn.addEventListener('click', function() {
+      dlog("closeScannerBtn clicked");
       stopRearCamera();
       stopFrontCamera();
       window.close();
@@ -420,6 +462,7 @@
       if (event.data.type === "PATROL_TOGGLE_CAMERA") {
         pauseBtn.click();
       } else if (event.data.type === "PATROL_CLOSE_SCANNER") {
+        dlog("received PATROL_CLOSE_SCANNER");
         stopRearCamera();
         stopFrontCamera();
         window.close();
@@ -427,6 +470,7 @@
     });
 
     window.addEventListener('beforeunload', function() {
+      dlog("beforeunload firing");
       stopRearCamera();
       stopFrontCamera();
     });
@@ -434,6 +478,11 @@
     window.addEventListener('error', function(e) {
       lastErrorEl.textContent = e.message;
       lastErrorEl.style.color = "#f44336";
+      dlog("window.onerror: " + e.message + " at " + e.filename + ":" + e.lineno);
+    });
+
+    window.addEventListener('unhandledrejection', function(e) {
+      dlog("unhandledrejection: " + (e.reason && e.reason.message ? e.reason.message : e.reason));
     });
   </script>
 
