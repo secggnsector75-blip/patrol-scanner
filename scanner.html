@@ -81,7 +81,7 @@
 
   <h3 style="margin-bottom:4px;">📷 Patrol Scanner</h3>
   <div id="scannerContainer">
-    <video id="video" autoplay playsinline></video>
+    <video id="video" autoplay playsinline muted></video>
     <canvas id="canvas" style="display:none;"></canvas>
     <div id="scanOverlay"><div class="label">Align QR Code</div></div>
   </div>
@@ -89,9 +89,10 @@
   <div id="status">Requesting camera access...</div>
   <div id="lastScan"></div>
   <button id="pauseBtn" disabled>⏸ Pause</button>
+  <button id="closeScannerBtn" style="background:#e33;">✕ Close Scanner</button>
   <div id="debugInfo" style="margin-top:14px;font-size:11px;color:#777;text-align:center;padding:0 16px;">
     jsQR loaded: <span id="jsqrStatus">checking...</span><br>
-    Frames scanned: <span id="frameCount">0</span><br>
+    Scans processed: <span id="frameCount">0</span><br>
     Last error: <span id="lastError">none</span>
   </div>
 
@@ -114,10 +115,8 @@
     const TARGET_ORIGIN = "*";
     const REQUIRE_SELFIE = params.get('selfie') === "1";
 
-    // Cap the resolution used for QR decoding — jsQR doesn't need more than
-    // this, and processing full native camera resolution (often 3840px+)
-    // via getImageData() 30-60x/sec is what was crashing the mobile WebView.
-    const MAX_QR_WIDTH = 640;
+    const MAX_QR_WIDTH = 480;       // capped canvas width for QR decoding
+    const SCAN_INTERVAL_MS = 250;   // only run getImageData()/jsQR ~4x/sec, not every animation frame
 
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
@@ -126,10 +125,11 @@
     const lastScanEl = document.getElementById('lastScan');
     const overlay = document.getElementById('scanOverlay');
     const pauseBtn = document.getElementById('pauseBtn');
+    const closeScannerBtn = document.getElementById('closeScannerBtn');
     const jsqrStatusEl = document.getElementById('jsqrStatus');
     const frameCountEl = document.getElementById('frameCount');
     const lastErrorEl = document.getElementById('lastError');
-    let frameCount = 0;
+    let scanCount = 0;
 
     const jsqrCheckInterval = setInterval(function() {
       if (typeof jsQR !== 'undefined') {
@@ -150,7 +150,7 @@
     let paused = false;
     let pendingToken = null;
     let pendingPhoto = null;
-    let scanLoopHandle = null;
+    let scanTimerHandle = null;
 
     function sendToOpener(message) {
       if (window.opener) {
@@ -158,12 +158,12 @@
       }
     }
 
-    // ---- Rear camera: reusable so it can be stopped/reacquired around the selfie step ----
+    // ---- Rear camera ----
     function startRearCamera() {
       return navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: "environment",
-          width: { ideal: MAX_QR_WIDTH },   // ask the camera itself for a smaller stream where supported
+          width: { ideal: MAX_QR_WIDTH },
           height: { ideal: MAX_QR_WIDTH }
         },
         audio: false
@@ -179,15 +179,28 @@
       });
     }
 
+    // CRITICAL for iOS Safari: stopping the track alone is not enough —
+    // the <video> element retains decode buffers until srcObject is
+    // explicitly cleared. Skipping this step is what causes memory to
+    // climb until WebKit silently kills the page (the "white screen").
     function stopRearCamera() {
       if (rearStream) {
         rearStream.getTracks().forEach(t => t.stop());
         rearStream = null;
       }
-      if (scanLoopHandle) {
-        cancelAnimationFrame(scanLoopHandle);
-        scanLoopHandle = null;
+      video.srcObject = null;
+      if (scanTimerHandle) {
+        clearTimeout(scanTimerHandle);
+        scanTimerHandle = null;
       }
+    }
+
+    function stopFrontCamera() {
+      if (frontStream) {
+        frontStream.getTracks().forEach(t => t.stop());
+        frontStream = null;
+      }
+      frontVideo.srcObject = null;
     }
 
     startRearCamera()
@@ -195,7 +208,7 @@
         statusEl.textContent = "Scanning for checkpoints...";
         pauseBtn.disabled = false;
         sendToOpener({ type: "PATROL_CAMERA_READY" });
-        scanLoopHandle = requestAnimationFrame(scanLoop);
+        scheduleNextScan();
       })
       .catch(function(err) {
         let msg = err.message;
@@ -206,30 +219,16 @@
         sendToOpener({ type: "PATROL_CAMERA_ERROR", message: msg });
       });
 
-    function finishScan(photoDataUrl) {
-      sendToOpener({ type: "PATROL_QR_SCAN", token: pendingToken, photo: photoDataUrl || "" });
-
-      stopRearCamera();
-      if (frontStream) { frontStream.getTracks().forEach(t => t.stop()); frontStream = null; }
-
-      pauseBtn.disabled = true;
-      lastScanEl.textContent = "✅ Checkpoint scanned! Closing...";
-      statusEl.textContent = "Done. Returning to the Patrol app.";
-
-      setTimeout(function() {
-        window.close();
-        setTimeout(function() {
-          statusEl.textContent = "✅ Scanned. You can close this tab now.";
-        }, 500);
-      }, 600);
+    // Throttled scan loop — runs detection at most every SCAN_INTERVAL_MS,
+    // instead of every requestAnimationFrame (~60x/sec on iPhone). This is
+    // the single biggest reduction in memory/CPU churn on iOS Safari.
+    function scheduleNextScan() {
+      scanTimerHandle = setTimeout(runScanCheck, SCAN_INTERVAL_MS);
     }
 
-    function scanLoop() {
+    function runScanCheck() {
       try {
         if (!paused && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
-          // Downscale to MAX_QR_WIDTH while preserving aspect ratio — this is
-          // the key fix: getImageData() only ever processes a small canvas,
-          // never the camera's native resolution.
           const scale = Math.min(1, MAX_QR_WIDTH / video.videoWidth);
           canvas.width = Math.round(video.videoWidth * scale);
           canvas.height = Math.round(video.videoHeight * scale);
@@ -242,8 +241,8 @@
             lastErrorEl.style.color = "#f44336";
           } else {
             const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "attemptBoth" });
-            frameCount++;
-            frameCountEl.textContent = frameCount;
+            scanCount++;
+            frameCountEl.textContent = scanCount;
 
             if (code && code.data && scanning) {
               scanning = false;
@@ -254,9 +253,9 @@
                 statusEl.textContent = "QR detected — confirm with a selfie";
                 openSelfieStep();
               } else {
-                finishScan("");
+                completeScanWithoutSelfie();
               }
-              return; // don't schedule another frame here — either selfie flow or finishScan takes over
+              return; // don't schedule another scan yet — resumes after selfie/confirm
             }
           }
         }
@@ -264,7 +263,20 @@
         lastErrorEl.textContent = err.message;
         lastErrorEl.style.color = "#f44336";
       }
-      scanLoopHandle = requestAnimationFrame(scanLoop);
+      scheduleNextScan();
+    }
+
+    // For sites that don't require a selfie — send immediately, then resume scanning
+    function completeScanWithoutSelfie() {
+      sendToOpener({ type: "PATROL_QR_SCAN", token: pendingToken, photo: "" });
+      lastScanEl.textContent = "✅ Scanned: " + pendingToken;
+      setTimeout(function() {
+        scanning = true;
+        pendingToken = null;
+        overlay.style.borderColor = "rgba(255,255,255,0.5)";
+        lastScanEl.textContent = "";
+        scheduleNextScan();
+      }, 1200);
     }
 
     // ============================================================
@@ -280,8 +292,8 @@
     const cancelSelfieBtn = document.getElementById('cancelSelfieBtn');
 
     function openSelfieStep() {
-      // Release the rear camera FIRST — never hold both rear and front open
-      // at the same time, which is the other major cause of the crash.
+      // Release the rear camera fully before opening the front camera —
+      // never hold both hardware streams open at once.
       stopRearCamera();
 
       selfieOverlay.classList.add('active');
@@ -307,10 +319,7 @@
 
     function captureSelfie() {
       const c = document.createElement('canvas');
-      // Downscale the selfie too — full native front-camera resolution can
-      // be 3000px+ wide, producing a multi-megabyte base64 string that is
-      // heavy to pass through postMessage and google.script.run.
-      const MAX_SELFIE_WIDTH = 480;
+      const MAX_SELFIE_WIDTH = 400;
       const scale = Math.min(1, MAX_SELFIE_WIDTH / frontVideo.videoWidth);
       c.width = Math.round(frontVideo.videoWidth * scale);
       c.height = Math.round(frontVideo.videoHeight * scale);
@@ -320,7 +329,7 @@
       cctx.scale(-1, 1);
       cctx.drawImage(frontVideo, 0, 0, c.width, c.height);
 
-      pendingPhoto = c.toDataURL('image/jpeg', 0.6);
+      pendingPhoto = c.toDataURL('image/jpeg', 0.55);
       selfiePreview.src = pendingPhoto;
       selfiePreview.style.display = 'block';
       frontVideo.style.display = 'none';
@@ -342,34 +351,46 @@
     function confirmSelfie() {
       if (!pendingPhoto) return;
       const photo = pendingPhoto;
-      closeSelfieOverlay(); // stops frontStream; rear stays stopped since we're closing anyway
-      finishScan(photo);
-    }
 
-    function cancelSelfie() {
-      closeSelfieOverlay();
+      sendToOpener({ type: "PATROL_QR_SCAN", token: pendingToken, photo: photo });
+
+      closeSelfieOverlayAndCleanup();
+      lastScanEl.textContent = "✅ Scanned with selfie confirmation";
       pendingToken = null;
       pendingPhoto = null;
-      scanning = true;
-      statusEl.textContent = "Scan cancelled — align QR code to try again";
-      overlay.style.borderColor = "rgba(255,255,255,0.5)";
 
-      // Reacquire the rear camera since scanning continues after a cancel
+      // Resume rear camera scanning for the next checkpoint — window stays open.
       startRearCamera()
         .then(function() {
-          scanLoopHandle = requestAnimationFrame(scanLoop);
+          scanning = true;
+          overlay.style.borderColor = "rgba(255,255,255,0.5)";
+          statusEl.textContent = "Scanning for checkpoints...";
+          setTimeout(function() { lastScanEl.textContent = ""; }, 1500);
+          scheduleNextScan();
         })
         .catch(function(err) {
           statusEl.textContent = "❌ Could not restart camera: " + err.message;
         });
     }
 
-    function closeSelfieOverlay() {
+    function cancelSelfie() {
+      closeSelfieOverlayAndCleanup();
+      pendingToken = null;
+      pendingPhoto = null;
+      scanning = true;
+      statusEl.textContent = "Scan cancelled — align QR code to try again";
+      overlay.style.borderColor = "rgba(255,255,255,0.5)";
+
+      startRearCamera()
+        .then(function() { scheduleNextScan(); })
+        .catch(function(err) {
+          statusEl.textContent = "❌ Could not restart camera: " + err.message;
+        });
+    }
+
+    function closeSelfieOverlayAndCleanup() {
       selfieOverlay.classList.remove('active');
-      if (frontStream) {
-        frontStream.getTracks().forEach(t => t.stop());
-        frontStream = null;
-      }
+      stopFrontCamera();
     }
 
     captureBtn.addEventListener('click', captureSelfie);
@@ -388,20 +409,31 @@
       }
     });
 
+    closeScannerBtn.addEventListener('click', function() {
+      stopRearCamera();
+      stopFrontCamera();
+      window.close();
+    });
+
     window.addEventListener('message', function(event) {
       if (!event.data) return;
       if (event.data.type === "PATROL_TOGGLE_CAMERA") {
         pauseBtn.click();
       } else if (event.data.type === "PATROL_CLOSE_SCANNER") {
         stopRearCamera();
-        if (frontStream) frontStream.getTracks().forEach(t => t.stop());
+        stopFrontCamera();
         window.close();
       }
     });
 
     window.addEventListener('beforeunload', function() {
       stopRearCamera();
-      if (frontStream) frontStream.getTracks().forEach(t => t.stop());
+      stopFrontCamera();
+    });
+
+    window.addEventListener('error', function(e) {
+      lastErrorEl.textContent = e.message;
+      lastErrorEl.style.color = "#f44336";
     });
   </script>
 
