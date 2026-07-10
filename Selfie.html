@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Patrol Selfie</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #111; color: #fff;
+    font-family: Arial, sans-serif; display: flex; flex-direction: column;
+    align-items: center; justify-content: flex-start; overflow-x: hidden;
+  }
+  #header { padding: 14px; font-size: 15px; text-align: center; }
+  #stage { position: relative; width: 100%; max-width: 480px; }
+  #stage video, #stage img {
+    width: 100%; border-radius: 10px; background: #000; display: block;
+    transform: scaleX(-1); /* mirror so it feels like a normal selfie */
+  }
+  #controls { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; justify-content: center; }
+  button {
+    padding: 10px 22px; font-size: 14px; border: none;
+    border-radius: 6px; color: #fff; cursor: pointer;
+  }
+  #captureBtn { background: #4CAF50; }
+  #confirmBtn { background: #2196F3; }
+  #retakeBtn { background: #888; }
+  #cancelBtn { background: #e33; }
+  #status { margin-top: 14px; font-size: 13px; color: #ccc; text-align: center; padding: 0 16px; }
+</style>
+</head>
+<body>
+
+  <div id="header">📸 <span id="titleText">Take a selfie</span></div>
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <img id="preview" style="display:none;">
+  </div>
+  <div id="controls">
+    <button id="captureBtn">📸 Capture</button>
+    <button id="confirmBtn" style="display:none;">✅ Confirm</button>
+    <button id="retakeBtn" style="display:none;">🔄 Retake</button>
+    <button id="cancelBtn">✕ Cancel</button>
+  </div>
+  <div id="status">Requesting camera access...</div>
+
+  <script>
+    // ---- Config passed from Index.html ----
+    // mode = "start" or "end" — only used for the header text
+    const params = new URLSearchParams(window.location.search);
+    const TARGET_ORIGIN = "*"; // opener verifies its own origin independently
+    const MODE = params.get('mode') === 'end' ? 'end' : 'start';
+
+    document.getElementById('titleText').textContent =
+      MODE === 'end' ? 'Take your end-of-patrol selfie' : 'Take your start-of-patrol selfie';
+
+    const video = document.getElementById('video');
+    const preview = document.getElementById('preview');
+    const statusEl = document.getElementById('status');
+    const captureBtn = document.getElementById('captureBtn');
+    const confirmBtn = document.getElementById('confirmBtn');
+    const retakeBtn = document.getElementById('retakeBtn');
+    const cancelBtn = document.getElementById('cancelBtn');
+
+    let stream = null;
+    let pendingPhoto = null;
+
+    function sendToOpener(message) {
+      if (window.opener) window.opener.postMessage(message, TARGET_ORIGIN);
+    }
+
+    function stopCamera() {
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      video.srcObject = null; // required to fully release decode buffers on iOS
+    }
+
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'user' }, width: { ideal: 480 } }
+    })
+      .then(function(s) {
+        stream = s;
+        video.srcObject = s;
+        video.play();
+        statusEl.textContent = "Align your face and tap Capture";
+      })
+      .catch(function(err) {
+        let msg = err.message;
+        if (err.name === 'NotAllowedError') msg = "Camera permission denied. Allow camera access and try again.";
+        else if (err.name === 'NotFoundError') msg = "No front camera detected on this device.";
+        else if (err.name === 'NotReadableError') msg = "Camera is busy or in use by another app.";
+        statusEl.textContent = "❌ " + msg;
+        sendToOpener({ type: "PATROL_SELFIE_ERROR", mode: MODE, message: msg });
+      });
+
+    function captureSelfie() {
+      const c = document.createElement('canvas');
+      const MAX_WIDTH = 480; // keep the base64 payload small — see notes from earlier debugging
+      const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
+      c.width = Math.round(video.videoWidth * scale);
+      c.height = Math.round(video.videoHeight * scale);
+
+      const ctx = c.getContext('2d');
+      ctx.translate(c.width, 0);
+      ctx.scale(-1, 1); // mirror to match the on-screen preview
+      ctx.drawImage(video, 0, 0, c.width, c.height);
+
+      pendingPhoto = c.toDataURL('image/jpeg', 0.6);
+      preview.src = pendingPhoto;
+      preview.style.display = 'block';
+      video.style.display = 'none';
+
+      captureBtn.style.display = 'none';
+      confirmBtn.style.display = 'inline-block';
+      retakeBtn.style.display = 'inline-block';
+    }
+
+    function retake() {
+      pendingPhoto = null;
+      preview.src = "";
+      preview.style.display = 'none';
+      video.style.display = 'block';
+      captureBtn.style.display = 'inline-block';
+      confirmBtn.style.display = 'none';
+      retakeBtn.style.display = 'none';
+    }
+
+    function confirmSelfieAndClose() {
+      if (!pendingPhoto) return;
+      sendToOpener({ type: "PATROL_SELFIE_CAPTURED", mode: MODE, photo: pendingPhoto });
+      stopCamera();
+      statusEl.textContent = "✅ Selfie captured. Closing...";
+      setTimeout(function() { window.close(); }, 400);
+    }
+
+    function cancelAndClose() {
+      sendToOpener({ type: "PATROL_SELFIE_CANCELLED", mode: MODE });
+      stopCamera();
+      window.close();
+    }
+
+    captureBtn.addEventListener('click', captureSelfie);
+    confirmBtn.addEventListener('click', confirmSelfieAndClose);
+    retakeBtn.addEventListener('click', retake);
+    cancelBtn.addEventListener('click', cancelAndClose);
+
+    window.addEventListener('beforeunload', stopCamera);
+  </script>
+
+</body>
+</html>
