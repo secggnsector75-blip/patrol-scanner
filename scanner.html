@@ -17,19 +17,14 @@
     "https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.min.js",
     function() { console.log("jsQR loaded from cdnjs"); },
     function() {
-      console.log("cdnjs failed, trying jsdelivr...");
       loadScript(
         "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js",
         function() { console.log("jsQR loaded from jsdelivr"); },
         function() {
-          console.log("jsdelivr also failed, trying unpkg...");
           loadScript(
             "https://unpkg.com/jsqr@1.4.0/dist/jsQR.min.js",
             function() { console.log("jsQR loaded from unpkg"); },
-            function() {
-              console.log("All CDNs failed to load jsQR");
-              window.__jsqrLoadFailed = true;
-            }
+            function() { window.__jsqrLoadFailed = true; }
           );
         }
       );
@@ -63,7 +58,6 @@
   }
   button:disabled { background: #333; cursor: not-allowed; }
 
-  /* ---- Mandatory selfie overlay (only shown for sites with RequireSelfie) ---- */
   #selfieOverlay {
     display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
     background: #111; z-index: 20; flex-direction: column; align-items: center;
@@ -73,7 +67,7 @@
   #selfieStage { position: relative; width: 100%; max-width: 480px; }
   #selfieStage video, #selfieStage img {
     width: 100%; border-radius: 10px; background: #000; display: block;
-    transform: scaleX(-1); /* mirror so it feels like a normal selfie */
+    transform: scaleX(-1);
   }
   #selfieControls { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; justify-content: center; }
   #selfieControls button { margin-top: 0; min-width: 110px; }
@@ -101,7 +95,6 @@
     Last error: <span id="lastError">none</span>
   </div>
 
-  <!-- Mandatory selfie step -->
   <div id="selfieOverlay">
     <div id="selfieHeader">📸 Take a selfie to confirm this scan</div>
     <div id="selfieStage">
@@ -117,10 +110,14 @@
   </div>
 
   <script>
-    // ---- Read config passed from Index.html ----
     const params = new URLSearchParams(window.location.search);
-    const TARGET_ORIGIN = "*"; // opener verifies OUR origin independently, so this stays safe
+    const TARGET_ORIGIN = "*";
     const REQUIRE_SELFIE = params.get('selfie') === "1";
+
+    // Cap the resolution used for QR decoding — jsQR doesn't need more than
+    // this, and processing full native camera resolution (often 3840px+)
+    // via getImageData() 30-60x/sec is what was crashing the mobile WebView.
+    const MAX_QR_WIDTH = 640;
 
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
@@ -147,12 +144,13 @@
       }
     }, 300);
 
-    let stream = null;         // rear camera (QR scanning)
-    let frontStream = null;    // front camera (selfie step)
+    let rearStream = null;
+    let frontStream = null;
     let scanning = true;
     let paused = false;
     let pendingToken = null;
     let pendingPhoto = null;
+    let scanLoopHandle = null;
 
     function sendToOpener(message) {
       if (window.opener) {
@@ -160,36 +158,58 @@
       }
     }
 
-    async function startCamera() {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
-          audio: false
-        });
+    // ---- Rear camera: reusable so it can be stopped/reacquired around the selfie step ----
+    function startRearCamera() {
+      return navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "environment",
+          width: { ideal: MAX_QR_WIDTH },   // ask the camera itself for a smaller stream where supported
+          height: { ideal: MAX_QR_WIDTH }
+        },
+        audio: false
+      }).then(function(stream) {
+        rearStream = stream;
         video.srcObject = stream;
-        video.onloadedmetadata = function() {
-          video.play();
-          statusEl.textContent = "Scanning for checkpoints...";
-          pauseBtn.disabled = false;
-          sendToOpener({ type: "PATROL_CAMERA_READY" });
-          requestAnimationFrame(scanLoop);
-        };
-      } catch (err) {
+        return new Promise(function(resolve) {
+          video.onloadedmetadata = function() {
+            video.play();
+            resolve();
+          };
+        });
+      });
+    }
+
+    function stopRearCamera() {
+      if (rearStream) {
+        rearStream.getTracks().forEach(t => t.stop());
+        rearStream = null;
+      }
+      if (scanLoopHandle) {
+        cancelAnimationFrame(scanLoopHandle);
+        scanLoopHandle = null;
+      }
+    }
+
+    startRearCamera()
+      .then(function() {
+        statusEl.textContent = "Scanning for checkpoints...";
+        pauseBtn.disabled = false;
+        sendToOpener({ type: "PATROL_CAMERA_READY" });
+        scanLoopHandle = requestAnimationFrame(scanLoop);
+      })
+      .catch(function(err) {
         let msg = err.message;
         if (err.name === 'NotAllowedError') msg = "Camera permission denied. Allow camera access and reopen this window.";
         else if (err.name === 'NotFoundError') msg = "No camera detected on this device.";
         else if (err.name === 'NotReadableError') msg = "Camera is busy or in use by another app.";
         statusEl.textContent = "❌ " + msg;
         sendToOpener({ type: "PATROL_CAMERA_ERROR", message: msg });
-      }
-    }
+      });
 
-    // Stops everything and closes the window — same behavior as before,
-    // now optionally carrying a photo along with the scan.
     function finishScan(photoDataUrl) {
       sendToOpener({ type: "PATROL_QR_SCAN", token: pendingToken, photo: photoDataUrl || "" });
 
-      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      stopRearCamera();
       if (frontStream) { frontStream.getTracks().forEach(t => t.stop()); frontStream = null; }
 
       pauseBtn.disabled = true;
@@ -207,9 +227,14 @@
     function scanLoop() {
       try {
         if (!paused && video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
-          canvas.width = video.videoWidth;
-          canvas.height = video.videoHeight;
+          // Downscale to MAX_QR_WIDTH while preserving aspect ratio — this is
+          // the key fix: getImageData() only ever processes a small canvas,
+          // never the camera's native resolution.
+          const scale = Math.min(1, MAX_QR_WIDTH / video.videoWidth);
+          canvas.width = Math.round(video.videoWidth * scale);
+          canvas.height = Math.round(video.videoHeight * scale);
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
           const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
           if (typeof jsQR === 'undefined') {
@@ -226,13 +251,12 @@
               overlay.style.borderColor = "#4CAF50";
 
               if (REQUIRE_SELFIE) {
-                // Pause here — do NOT send or finish yet. Selfie step decides.
                 statusEl.textContent = "QR detected — confirm with a selfie";
                 openSelfieStep();
               } else {
-                finishScan(""); // original behavior, unchanged
+                finishScan("");
               }
-              return;
+              return; // don't schedule another frame here — either selfie flow or finishScan takes over
             }
           }
         }
@@ -240,7 +264,7 @@
         lastErrorEl.textContent = err.message;
         lastErrorEl.style.color = "#f44336";
       }
-      requestAnimationFrame(scanLoop);
+      scanLoopHandle = requestAnimationFrame(scanLoop);
     }
 
     // ============================================================
@@ -256,6 +280,10 @@
     const cancelSelfieBtn = document.getElementById('cancelSelfieBtn');
 
     function openSelfieStep() {
+      // Release the rear camera FIRST — never hold both rear and front open
+      // at the same time, which is the other major cause of the crash.
+      stopRearCamera();
+
       selfieOverlay.classList.add('active');
       captureBtn.style.display = 'inline-block';
       confirmBtn.style.display = 'none';
@@ -263,10 +291,12 @@
       selfiePreview.style.display = 'none';
       frontVideo.style.display = 'block';
 
-      navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'user' } } })
-        .then(function(fStream) {
-          frontStream = fStream;
-          frontVideo.srcObject = fStream;
+      navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'user' }, width: { ideal: MAX_QR_WIDTH } }
+      })
+        .then(function(stream) {
+          frontStream = stream;
+          frontVideo.srcObject = stream;
           frontVideo.play();
         })
         .catch(function(err) {
@@ -277,25 +307,19 @@
 
     function captureSelfie() {
       const c = document.createElement('canvas');
-
-      // Downscale to a max width of 480px before encoding. Native front-camera
-      // resolution on most phones is 3000px+ wide, which produces multi-megabyte
-      // base64 strings — sending several of those through postMessage and
-      // google.script.run over a patrol session exhausts WebView memory and
-      // causes the white-screen crash. 480px is still perfectly readable for
-      // confirmation purposes.
-      const MAX_WIDTH = 480;
-      const scale = Math.min(1, MAX_WIDTH / frontVideo.videoWidth);
+      // Downscale the selfie too — full native front-camera resolution can
+      // be 3000px+ wide, producing a multi-megabyte base64 string that is
+      // heavy to pass through postMessage and google.script.run.
+      const MAX_SELFIE_WIDTH = 480;
+      const scale = Math.min(1, MAX_SELFIE_WIDTH / frontVideo.videoWidth);
       c.width = Math.round(frontVideo.videoWidth * scale);
       c.height = Math.round(frontVideo.videoHeight * scale);
 
       const cctx = c.getContext('2d');
       cctx.translate(c.width, 0);
-      cctx.scale(-1, 1); // mirror to match the on-screen preview
+      cctx.scale(-1, 1);
       cctx.drawImage(frontVideo, 0, 0, c.width, c.height);
 
-      // Lower quality further shrinks the payload — fine for a confirmation
-      // photo, not meant to be a print-quality image.
       pendingPhoto = c.toDataURL('image/jpeg', 0.6);
       selfiePreview.src = pendingPhoto;
       selfiePreview.style.display = 'block';
@@ -318,11 +342,10 @@
     function confirmSelfie() {
       if (!pendingPhoto) return;
       const photo = pendingPhoto;
-      closeSelfieOverlay();
+      closeSelfieOverlay(); // stops frontStream; rear stays stopped since we're closing anyway
       finishScan(photo);
     }
 
-    // Cancels just this scan attempt — no data sent, rear camera resumes
     function cancelSelfie() {
       closeSelfieOverlay();
       pendingToken = null;
@@ -330,7 +353,15 @@
       scanning = true;
       statusEl.textContent = "Scan cancelled — align QR code to try again";
       overlay.style.borderColor = "rgba(255,255,255,0.5)";
-      requestAnimationFrame(scanLoop); // resume the loop (rear stream never stopped)
+
+      // Reacquire the rear camera since scanning continues after a cancel
+      startRearCamera()
+        .then(function() {
+          scanLoopHandle = requestAnimationFrame(scanLoop);
+        })
+        .catch(function(err) {
+          statusEl.textContent = "❌ Could not restart camera: " + err.message;
+        });
     }
 
     function closeSelfieOverlay() {
@@ -345,8 +376,6 @@
     confirmBtn.addEventListener('click', confirmSelfie);
     retakeBtn.addEventListener('click', retakeSelfie);
     cancelSelfieBtn.addEventListener('click', cancelSelfie);
-
-    // ============================================================
 
     pauseBtn.addEventListener('click', function() {
       paused = !paused;
@@ -364,18 +393,16 @@
       if (event.data.type === "PATROL_TOGGLE_CAMERA") {
         pauseBtn.click();
       } else if (event.data.type === "PATROL_CLOSE_SCANNER") {
-        if (stream) stream.getTracks().forEach(t => t.stop());
+        stopRearCamera();
         if (frontStream) frontStream.getTracks().forEach(t => t.stop());
         window.close();
       }
     });
 
     window.addEventListener('beforeunload', function() {
-      if (stream) stream.getTracks().forEach(t => t.stop());
+      stopRearCamera();
       if (frontStream) frontStream.getTracks().forEach(t => t.stop());
     });
-
-    startCamera();
   </script>
 
 </body>
