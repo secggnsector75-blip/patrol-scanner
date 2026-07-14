@@ -121,6 +121,9 @@
     let scanning = true;
     let paused = false;
     let scanTimerHandle = null;
+    let lastScannedToken = null;
+    let lastScannedAt = 0;
+    const TOKEN_COOLDOWN_MS = 5000; // ignore the same QR again for 5s after a successful send
 
     function sendToOpener(message) {
       if (window.opener) window.opener.postMessage(message, TARGET_ORIGIN);
@@ -201,21 +204,34 @@
             frameCountEl.textContent = scanCount;
 
             if (code && code.data && scanning) {
-              scanning = false;
-              overlay.style.borderColor = "#4CAF50";
-              dlog("QR detected: " + code.data);
+              const now = Date.now();
+              const isSameTokenTooSoon = (code.data === lastScannedToken) && (now - lastScannedAt < TOKEN_COOLDOWN_MS);
 
-              // No selfie step anymore — send immediately and resume.
-              sendToOpener({ type: "PATROL_QR_SCAN", token: code.data });
-              lastScanEl.textContent = "✅ Scanned: " + code.data;
+              if (isSameTokenTooSoon) {
+                // Guard is likely still holding the phone over the same QR
+                // code — ignore it instead of re-triggering a duplicate
+                // scan attempt (which was causing rapid back-to-back
+                // google.script.run calls and instability).
+                dlog("QR ignored (cooldown): " + code.data);
+              } else {
+                scanning = false;
+                overlay.style.borderColor = "#4CAF50";
+                dlog("QR detected: " + code.data);
 
-              setTimeout(function() {
-                scanning = true;
-                overlay.style.borderColor = "rgba(255,255,255,0.5)";
-                lastScanEl.textContent = "";
-                scheduleNextScan();
-              }, 1000);
-              return;
+                lastScannedToken = code.data;
+                lastScannedAt = now;
+
+                sendToOpener({ type: "PATROL_QR_SCAN", token: code.data });
+                lastScanEl.textContent = "✅ Scanned: " + code.data;
+
+                setTimeout(function() {
+                  scanning = true;
+                  overlay.style.borderColor = "rgba(255,255,255,0.5)";
+                  lastScanEl.textContent = "";
+                  scheduleNextScan();
+                }, 1000);
+                return;
+              }
             }
           }
         }
