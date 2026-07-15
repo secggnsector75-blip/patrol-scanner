@@ -71,7 +71,7 @@
   <div id="status">Requesting camera access...</div>
   <div id="lastScan"></div>
   <button id="pauseBtn" disabled>⏸ Pause</button>
-  <button id="closeScannerBtn" style="background:#e33;">✕ Close Scanner</button>
+  <button id="backBtn" style="background:#e33;">← Back to Patrol</button>
   <div id="debugInfo" style="margin-top:14px;font-size:11px;color:#777;text-align:center;padding:0 16px;">
     jsQR loaded: <span id="jsqrStatus">checking...</span><br>
     Scans processed: <span id="frameCount">0</span><br>
@@ -79,10 +79,12 @@
   </div>
 
   <script>
-    const TARGET_ORIGIN = "*"; // opener/parent verifies its own origin independently
-
     const MAX_QR_WIDTH = 480;
     const SCAN_INTERVAL_MS = 250;
+
+    const params = new URLSearchParams(window.location.search);
+    const RETURN_URL = params.get('return') || '';
+    const SITE_ID = params.get('site') || '';
 
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
@@ -91,17 +93,14 @@
     const lastScanEl = document.getElementById('lastScan');
     const overlay = document.getElementById('scanOverlay');
     const pauseBtn = document.getElementById('pauseBtn');
-    const closeScannerBtn = document.getElementById('closeScannerBtn');
+    const backBtn = document.getElementById('backBtn');
     const jsqrStatusEl = document.getElementById('jsqrStatus');
     const frameCountEl = document.getElementById('frameCount');
     const lastErrorEl = document.getElementById('lastError');
     let scanCount = 0;
 
     function dlog(msg) {
-      try {
-        console.log("[scanner] " + msg);
-        sendToOpener({ type: "PATROL_DEBUG_LOG", message: msg, ts: Date.now() });
-      } catch (e) { /* ignore */ }
+      console.log("[scanner] " + msg);
     }
 
     const jsqrCheckInterval = setInterval(function() {
@@ -121,22 +120,24 @@
     let scanning = true;
     let paused = false;
     let scanTimerHandle = null;
-    let lastScannedToken = null;
-    let lastScannedAt = 0;
-    const TOKEN_COOLDOWN_MS = 5000; // ignore the same QR again for 5s after a successful send
+    let hasReturned = false; // guards against navigating back twice
 
-    // Works whether this page is loaded as a real popup (window.opener)
-    // or embedded as an inline <iframe> (window.parent) — this is what
-    // lets scanner.html run inline inside Index.html to avoid iOS Safari's
-    // background-tab eviction that happens when the scanner is a separate
-    // tab/popup holding a live camera stream.
-    function getTargetWindow() {
-      return (window.parent && window.parent !== window) ? window.parent : window.opener;
-    }
+    function goBack(withToken) {
+      if (hasReturned) return;
+      hasReturned = true;
+      stopRearCamera();
 
-    function sendToOpener(message) {
-      const target = getTargetWindow();
-      if (target) target.postMessage(message, TARGET_ORIGIN);
+      if (!RETURN_URL) {
+        statusEl.textContent = "⚠️ No return URL configured — close this tab and reopen the app.";
+        return;
+      }
+
+      let url = RETURN_URL;
+      if (withToken) {
+        const sep = RETURN_URL.indexOf('?') === -1 ? '?' : '&';
+        url = RETURN_URL + sep + 'scan=' + encodeURIComponent(withToken) + '&t=' + Date.now();
+      }
+      window.location.href = url;
     }
 
     function startRearCamera() {
@@ -178,17 +179,15 @@
       .then(function() {
         statusEl.textContent = "Scanning for checkpoints...";
         pauseBtn.disabled = false;
-        sendToOpener({ type: "PATROL_CAMERA_READY" });
         scheduleNextScan();
       })
       .catch(function(err) {
         let msg = err.message;
-        if (err.name === 'NotAllowedError') msg = "Camera permission denied. Allow camera access and reopen this window.";
+        if (err.name === 'NotAllowedError') msg = "Camera permission denied. Allow camera access and try again.";
         else if (err.name === 'NotFoundError') msg = "No camera detected on this device.";
         else if (err.name === 'NotReadableError') msg = "Camera is busy or in use by another app.";
         statusEl.textContent = "❌ " + msg;
         dlog("boot: FAILED - " + err.name + ": " + err.message);
-        sendToOpener({ type: "PATROL_CAMERA_ERROR", message: msg });
       });
 
     function scheduleNextScan() {
@@ -214,34 +213,17 @@
             frameCountEl.textContent = scanCount;
 
             if (code && code.data && scanning) {
-              const now = Date.now();
-              const isSameTokenTooSoon = (code.data === lastScannedToken) && (now - lastScannedAt < TOKEN_COOLDOWN_MS);
-
-              if (isSameTokenTooSoon) {
-                // Guard is likely still holding the phone over the same QR
-                // code — ignore it instead of re-triggering a duplicate
-                // scan attempt (which was causing rapid back-to-back
-                // google.script.run calls and instability).
-                dlog("QR ignored (cooldown): " + code.data);
-              } else {
-                scanning = false;
-                overlay.style.borderColor = "#4CAF50";
-                dlog("QR detected: " + code.data);
-
-                lastScannedToken = code.data;
-                lastScannedAt = now;
-
-                sendToOpener({ type: "PATROL_QR_SCAN", token: code.data });
-                lastScanEl.textContent = "✅ Scanned: " + code.data;
-
-                setTimeout(function() {
-                  scanning = true;
-                  overlay.style.borderColor = "rgba(255,255,255,0.5)";
-                  lastScanEl.textContent = "";
-                  scheduleNextScan();
-                }, 1000);
-                return;
-              }
+              scanning = false;
+              overlay.style.borderColor = "#4CAF50";
+              dlog("QR detected: " + code.data);
+              lastScanEl.textContent = "✅ Scanned: " + code.data;
+              statusEl.textContent = "Returning to patrol...";
+              // Hand off immediately — since we're navigating away to a
+              // single tab (not a popup/iframe), there's no need to resume
+              // scanning here; the next scan starts fresh when the guard
+              // taps "Scan Checkpoint" again on Index.html.
+              goBack(code.data);
+              return;
             }
           }
         }
@@ -264,23 +246,9 @@
       }
     });
 
-    closeScannerBtn.addEventListener('click', function() {
-      dlog("closeScannerBtn clicked");
-      stopRearCamera();
-      sendToOpener({ type: "PATROL_SCANNER_CLOSED" });
-      if (window.opener) window.close(); // only relevant if ever opened as a real popup
-    });
-
-    window.addEventListener('message', function(event) {
-      if (!event.data) return;
-      if (event.data.type === "PATROL_TOGGLE_CAMERA") {
-        pauseBtn.click();
-      } else if (event.data.type === "PATROL_CLOSE_SCANNER") {
-        dlog("received PATROL_CLOSE_SCANNER");
-        stopRearCamera();
-        sendToOpener({ type: "PATROL_SCANNER_CLOSED" });
-        if (window.opener) window.close();
-      }
+    backBtn.addEventListener('click', function() {
+      dlog("backBtn clicked");
+      goBack(null);
     });
 
     window.addEventListener('beforeunload', function() {
