@@ -79,7 +79,7 @@
   </div>
 
   <script>
-    const TARGET_ORIGIN = "*"; // opener verifies its own origin independently
+    const TARGET_ORIGIN = "*"; // opener/parent verifies its own origin independently
 
     const MAX_QR_WIDTH = 480;
     const SCAN_INTERVAL_MS = 250;
@@ -125,8 +125,18 @@
     let lastScannedAt = 0;
     const TOKEN_COOLDOWN_MS = 5000; // ignore the same QR again for 5s after a successful send
 
+    // Works whether this page is loaded as a real popup (window.opener)
+    // or embedded as an inline <iframe> (window.parent) — this is what
+    // lets scanner.html run inline inside Index.html to avoid iOS Safari's
+    // background-tab eviction that happens when the scanner is a separate
+    // tab/popup holding a live camera stream.
+    function getTargetWindow() {
+      return (window.parent && window.parent !== window) ? window.parent : window.opener;
+    }
+
     function sendToOpener(message) {
-      if (window.opener) window.opener.postMessage(message, TARGET_ORIGIN);
+      const target = getTargetWindow();
+      if (target) target.postMessage(message, TARGET_ORIGIN);
     }
 
     function startRearCamera() {
@@ -257,7 +267,8 @@
     closeScannerBtn.addEventListener('click', function() {
       dlog("closeScannerBtn clicked");
       stopRearCamera();
-      window.close();
+      sendToOpener({ type: "PATROL_SCANNER_CLOSED" });
+      if (window.opener) window.close(); // only relevant if ever opened as a real popup
     });
 
     window.addEventListener('message', function(event) {
@@ -267,7 +278,8 @@
       } else if (event.data.type === "PATROL_CLOSE_SCANNER") {
         dlog("received PATROL_CLOSE_SCANNER");
         stopRearCamera();
-        window.close();
+        sendToOpener({ type: "PATROL_SCANNER_CLOSED" });
+        if (window.opener) window.close();
       }
     });
 
